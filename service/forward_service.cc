@@ -12,6 +12,7 @@
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/future-util.hh>
 #include <seastar/core/smp.hh>
+#include <seastar/coroutine/parallel_for_each.hh>
 
 #include "cql_serialization_format.hh"
 #include "db/consistency_level.hh"
@@ -143,10 +144,12 @@ public:
 
         // Try to send this forward_request to another node.
         try {
+            flogger.warn("try: _retry_available = {}", _retry_available);
             co_return co_await ser::forward_request_rpc_verbs::send_forward_request(
                 &_forwarder._messaging, id, req, _tr_info
             );
         } catch(rpc::closed_error& e) {
+            flogger.warn("catch: _retry_available = {}", _retry_available);
             // If a retry has already been done, do a rethrow
             if (!_retry_available) {
                 flogger.error("failed to send forward_request to node {}: {}", id, e.what());
@@ -327,6 +330,16 @@ future<> forward_service::uninit_messaging_service() {
     return ser::forward_request_rpc_verbs::unregister(&_messaging);
 }
 
+struct request_to_dispatch {
+    netw::messaging_service::msg_addr destination_id;
+    query::forward_request request;
+
+    tracing::trace_state_ptr tr_state;
+
+    std::optional<query::forward_result>& result_to_merge_with;
+    retrying_dispatcher &dispatcher;
+};
+
 future<query::forward_result> forward_service::dispatch(query::forward_request req_, tracing::trace_state_ptr tr_state_) {
     query::forward_request req = std::move(req_);
     tracing::trace_state_ptr tr_state = std::move(tr_state_);
@@ -364,38 +377,50 @@ future<query::forward_result> forward_service::dispatch(query::forward_request r
     tracing::trace(tr_state, "Dispatching forward_request to {} endpoints", vnodes_per_addr.size());
 
     retrying_dispatcher dispatcher(*this, tr_state);
-
     std::optional<query::forward_result> result;
-    // Forward request to each endpoint and merge results.
-    co_await parallel_for_each(vnodes_per_addr.begin(), vnodes_per_addr.end(),
-        [this, &req, &result, &tr_state, &dispatcher] (std::pair<netw::messaging_service::msg_addr, dht::partition_range_vector> vnodes_with_addr) -> future<> {
-            netw::messaging_service::msg_addr addr = vnodes_with_addr.first;
-            std::optional<query::forward_result>& result_ = result;
-            tracing::trace_state_ptr& tr_state_ = tr_state;
-            retrying_dispatcher& dispatcher_ = dispatcher;
 
+    std::vector<request_to_dispatch> to_dispatch;
+    to_dispatch.reserve(vnodes_per_addr.size());
+    std::transform(
+        vnodes_per_addr.begin(),
+        vnodes_per_addr.end(),
+        std::back_inserter(to_dispatch),
+        [&dispatcher, &result, &req, &tr_state] (std::pair<netw::messaging_service::msg_addr, dht::partition_range_vector> vnodes_with_addr) -> request_to_dispatch {
             query::forward_request req_with_modified_pr = req;
             req_with_modified_pr.pr = std::move(vnodes_with_addr.second);
 
-            tracing::trace(tr_state_, "Sending forward_request to {}", addr);
-            flogger.debug("dispatching forward_request={} to address={}", req_with_modified_pr, addr);
+            return request_to_dispatch {
+                .destination_id = vnodes_with_addr.first,
+                .request = req_with_modified_pr,
+                .tr_state = tr_state,
+                .result_to_merge_with = result,
+                .dispatcher = dispatcher
+            };
+        }
+    );
 
-            query::forward_result partial_result = co_await dispatcher_.dispatch_to_node(
-                addr,
-                req_with_modified_pr
+    // Forward request to each endpoint and merge results.
+    co_await coroutine::parallel_for_each(to_dispatch,
+        [] (request_to_dispatch rd) -> future<> {
+            tracing::trace(rd.tr_state, "Sending forward_request to {}", rd.destination_id);
+            flogger.debug("dispatching forward_request={} to address={}", rd.request, rd.destination_id);
+
+            query::forward_result partial_result = co_await rd.dispatcher.dispatch_to_node(
+                rd.destination_id,
+                rd.request
             );
 
             query::forward_result::printer partial_result_printer{
-                .types = req_with_modified_pr.reduction_types,
+                .types = rd.request.reduction_types,
                 .res = partial_result
             };
-            tracing::trace(tr_state_, "Received forward_result={} from {}", partial_result_printer, addr);
-            flogger.debug("received forward_result={} from {}", partial_result_printer, addr);
+            tracing::trace(rd.tr_state, "Received forward_result={} from {}", partial_result_printer, rd.destination_id);
+            flogger.debug("received forward_result={} from {}", partial_result_printer, rd.destination_id);
 
-            if (result_) {
-                result_->merge(partial_result, req_with_modified_pr.reduction_types);
+            if (rd.result_to_merge_with) {
+                rd.result_to_merge_with->merge(partial_result, rd.request.reduction_types);
             } else {
-                result_ = partial_result;
+                rd.result_to_merge_with = partial_result;
             }
         }
     );
