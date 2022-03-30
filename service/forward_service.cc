@@ -165,6 +165,41 @@ public:
     }
 };
 
+struct request_to_dispatch {
+    netw::messaging_service::msg_addr destination_id;
+    query::forward_request request;
+
+    tracing::trace_state_ptr tr_state;
+
+    lw_shared_ptr<std::optional<query::forward_result>> result_to_merge_with;
+    lw_shared_ptr<retrying_dispatcher> dispatcher;
+
+    future<> send() {
+        tracing::trace(tr_state, "Sending forward_request to {}", destination_id);
+        flogger.debug("dispatching forward_request={} to address={}", request, destination_id);
+
+        query::forward_result partial_result = co_await dispatcher->dispatch_to_node(
+            destination_id,
+            request
+        );
+
+        query::forward_result::printer partial_result_printer{
+            .types = request.reduction_types,
+            .res = partial_result
+        };
+        tracing::trace(tr_state, "Received forward_result={} from {}", partial_result_printer, destination_id);
+        flogger.debug("received forward_result={} from {}", partial_result_printer, destination_id);
+
+        if (result_to_merge_with->has_value()) {
+            (*result_to_merge_with)->merge(partial_result, request.reduction_types);
+        } else {
+            result_to_merge_with = partial_result;
+        }
+    }
+
+};
+
+
 static dht::partition_range_vector retain_ranges_owned_by_this_shard(
     schema_ptr schema,
     dht::partition_range_vector pr
@@ -330,16 +365,6 @@ future<> forward_service::uninit_messaging_service() {
     return ser::forward_request_rpc_verbs::unregister(&_messaging);
 }
 
-struct request_to_dispatch {
-    netw::messaging_service::msg_addr destination_id;
-    query::forward_request request;
-
-    tracing::trace_state_ptr tr_state;
-
-    std::optional<query::forward_result>& result_to_merge_with;
-    retrying_dispatcher &dispatcher;
-};
-
 future<query::forward_result> forward_service::dispatch(query::forward_request req_, tracing::trace_state_ptr tr_state_) {
     query::forward_request req = std::move(req_);
     tracing::trace_state_ptr tr_state = std::move(tr_state_);
@@ -376,16 +401,18 @@ future<query::forward_result> forward_service::dispatch(query::forward_request r
 
     tracing::trace(tr_state, "Dispatching forward_request to {} endpoints", vnodes_per_addr.size());
 
-    retrying_dispatcher dispatcher(*this, tr_state);
-    std::optional<query::forward_result> result;
+    auto dispatcher = make_lw_shared<retrying_dispatcher>(*this, tr_state);
+    auto result = make_lw_shared<std::optional<query::forward_result>>();
 
-    std::vector<request_to_dispatch> to_dispatch;
-    to_dispatch.reserve(vnodes_per_addr.size());
+    std::vector<request_to_dispatch> requests_to_dispatch;
+    requests_to_dispatch.reserve(vnodes_per_addr.size());
     std::transform(
         vnodes_per_addr.begin(),
         vnodes_per_addr.end(),
-        std::back_inserter(to_dispatch),
-        [&dispatcher, &result, &req, &tr_state] (std::pair<netw::messaging_service::msg_addr, dht::partition_range_vector> vnodes_with_addr) -> request_to_dispatch {
+        std::back_inserter(requests_to_dispatch),
+        [&dispatcher, &result, &req, &tr_state] (
+            std::pair<netw::messaging_service::msg_addr, dht::partition_range_vector> vnodes_with_addr
+        ) -> request_to_dispatch {
             query::forward_request req_with_modified_pr = req;
             req_with_modified_pr.pr = std::move(vnodes_with_addr.second);
 
@@ -399,40 +426,35 @@ future<query::forward_result> forward_service::dispatch(query::forward_request r
         }
     );
 
-    // Forward request to each endpoint and merge results.
-    co_await coroutine::parallel_for_each(to_dispatch,
-        [] (request_to_dispatch rd) -> future<> {
-            tracing::trace(rd.tr_state, "Sending forward_request to {}", rd.destination_id);
-            flogger.debug("dispatching forward_request={} to address={}", rd.request, rd.destination_id);
+    return do_with(dispatcher, result, requests_to_dispatch,
+        [req = std::move(req), tr_state = std::move(tr_state)] (
+            lw_shared_ptr<retrying_dispatcher>& dispatcher,
+            lw_shared_ptr<std::optional<query::forward_result>>& result,
+            std::vector<request_to_dispatch>& requests_to_dispatch
+        ) -> future<query::forward_result> {
+            // Forward request to each endpoint and merge results.
+            return parallel_for_each(requests_to_dispatch,
+                [] (request_to_dispatch req) {
+                    return req.send();
+                }
+            ).then(
+                [
+                    &result,
+                    reduction_types = std::move(req.reduction_types),
+                    tr_state = std::move(tr_state)
+                ] () -> query::forward_result {
+                    query::forward_result::printer result_printer{
+                        .types = reduction_types,
+                        .res = result->value()
+                    };
 
-            query::forward_result partial_result = co_await rd.dispatcher.dispatch_to_node(
-                rd.destination_id,
-                rd.request
-            );
+                    tracing::trace(tr_state, "Merged result is {}", result_printer);
+                    flogger.debug("merged result is {}", result_printer);
 
-            query::forward_result::printer partial_result_printer{
-                .types = rd.request.reduction_types,
-                .res = partial_result
-            };
-            tracing::trace(rd.tr_state, "Received forward_result={} from {}", partial_result_printer, rd.destination_id);
-            flogger.debug("received forward_result={} from {}", partial_result_printer, rd.destination_id);
-
-            if (rd.result_to_merge_with) {
-                rd.result_to_merge_with->merge(partial_result, rd.request.reduction_types);
-            } else {
-                rd.result_to_merge_with = partial_result;
-            }
+                    return result->value();
+                });
         }
     );
-
-    query::forward_result::printer result_printer{
-        .types = req.reduction_types,
-        .res = *result
-    };
-    tracing::trace(tr_state, "Merged result is {}", result_printer);
-    flogger.debug("merged result is {}", result_printer);
-
-    co_return *result;
 }
 
 void forward_service::register_metrics() {
