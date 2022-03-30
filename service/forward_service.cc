@@ -137,31 +137,29 @@ public:
 
     future<query::forward_result> dispatch_to_node(netw::msg_addr id, query::forward_request req) {
         if (utils::fb_utilities::is_me(id.addr)) {
-            co_return co_await _forwarder.dispatch_to_shards(req, _tr_info);
+            return _forwarder.dispatch_to_shards(req, _tr_info);
         }
 
         _forwarder._stats.requests_dispatched_to_other_nodes += 1;
 
         // Try to send this forward_request to another node.
-        try {
-            flogger.warn("try: _retry_available = {}", _retry_available);
-            co_return co_await ser::forward_request_rpc_verbs::send_forward_request(
+        return do_with(id, req, [this] (netw::msg_addr& id, query::forward_request& req) -> future<query::forward_result> {
+            return ser::forward_request_rpc_verbs::send_forward_request(
                 &_forwarder._messaging, id, req, _tr_info
-            );
-        } catch(rpc::closed_error& e) {
-            flogger.warn("catch: _retry_available = {}", _retry_available);
-            // If a retry has already been done, do a rethrow
-            if (!_retry_available) {
-                flogger.error("failed to send forward_request to node {}: {}", id, e.what());
-                throw;
-            }
-        }
+            ).handle_exception_type([this, &req, &id] (rpc::closed_error& e) -> future<query::forward_result> {
+                if (!_retry_available) {
+                    flogger.error("failed to send forward_request to node {}: {}", id, e.what());
+                    // If a retry has already been done, do a rethrow
+                    return make_exception_future<query::forward_result>(e);
+                }
 
-        // In case of forwarding failure, retry using super-coordinator as a coordinator
-        flogger.warn("retrying forward_request={} on a super-coordinator after failing to send it to {}", req, id);
-        tracing::trace(_tr_state, "retrying forward_request={} on a super-coordinator after failing to send it to", req, id);
-        _retry_available = false;
-        co_return co_await _forwarder.dispatch_to_shards(req, _tr_info);
+                // In case of forwarding failure, retry using super-coordinator as a coordinator
+                flogger.warn("retrying forward_request={} on a super-coordinator after failing to send it to {}", req, id);
+                tracing::trace(_tr_state, "retrying forward_request={} on a super-coordinator after failing to send it to", req, id);
+                _retry_available = false;
+                return _forwarder.dispatch_to_shards(req, _tr_info);
+            });
+        });
     }
 };
 
