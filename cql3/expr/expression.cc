@@ -1048,49 +1048,72 @@ std::ostream& operator<<(std::ostream& os, const column_value& cv) {
 }
 
 std::ostream& operator<<(std::ostream& os, const expression& expr) {
+    expression::printer pr {
+        .expr_to_print = expr,
+        .mark_unresolved_identifiers = true
+    };
+
+    return os << pr;
+}
+
+std::ostream& operator<<(std::ostream& os, const expression::printer& pr) {
+    // Wraps expression in expression::printer to forward formatting options
+    auto to_printer = [&pr] (const expression& expr) -> expression::printer {
+        return expression::printer {
+            .expr_to_print = expr,
+            .mark_unresolved_identifiers = pr.mark_unresolved_identifiers
+        };
+    };
+
     expr::visit(overloaded_functor{
             [&] (const constant& v) { os << v.view(); },
-            [&] (const conjunction& conj) { fmt::print(os, "({})", fmt::join(conj.children, ") AND (")); },
+            [&] (const conjunction& conj) {
+                fmt::print(os, "({})", fmt::join(conj.children | transformed(to_printer), ") AND ("));
+            },
             [&] (const binary_operator& opr) {
-                os << "(" << opr.lhs << ") " << opr.op << ' ' << opr.rhs;
+                os << "(" << to_printer(opr.lhs) << ") " << opr.op << ' ' << to_printer(opr.rhs);
             },
             [&] (const token& t) { os << "TOKEN"; },
             [&] (const column_value& col) {
                 fmt::print(os, "{}", col);
             },
             [&] (const subscript& sub) {
-                fmt::print(os, "{}[{}]", sub.val, sub.sub);
+                fmt::print(os, "{}[{}]", to_printer(sub.val), to_printer(sub.sub));
             },
             [&] (const unresolved_identifier& ui) {
-                fmt::print(os, "unresolved({})", *ui.ident);
+                if (pr.mark_unresolved_identifiers) {
+                    fmt::print(os, "unresolved({})", *ui.ident);
+                } else {
+                    fmt::print(os, "{}", *ui.ident);
+                }
             },
             [&] (const column_mutation_attribute& cma)  {
                 fmt::print(os, "{}({})",
                         cma.kind == column_mutation_attribute::attribute_kind::ttl ? "TTL" : "WRITETIME",
-                        cma.column);
+                        to_printer(cma.column));
             },
             [&] (const function_call& fc)  {
                 std::visit(overloaded_functor{
                     [&] (const functions::function_name& named) {
-                        fmt::print(os, "{}({})", named, fmt::join(fc.args, ", "));
+                        fmt::print(os, "{}({})", named, fmt::join(fc.args | transformed(to_printer), ", "));
                     },
                     [&] (const shared_ptr<functions::function>& anon) {
-                        fmt::print(os, "<anonymous function>({})", fmt::join(fc.args, ", "));
+                        fmt::print(os, "<anonymous function>({})", fmt::join(fc.args | transformed(to_printer), ", "));
                     },
                 }, fc.func);
             },
             [&] (const cast& c)  {
                 std::visit(overloaded_functor{
                     [&] (const cql3_type& t) {
-                        fmt::print(os, "({} AS {})", c.arg, t);
+                        fmt::print(os, "({} AS {})", to_printer(c.arg), t);
                     },
                     [&] (const shared_ptr<cql3_type::raw>& t) {
-                        fmt::print(os, "({}) {}", t, c.arg);
+                        fmt::print(os, "({}) {}", t, to_printer(c.arg));
                     },
                 }, c.type);
             },
             [&] (const field_selection& fs)  {
-                fmt::print(os, "({}.{})", fs.structure, fs.field);
+                fmt::print(os, "({}.{})", to_printer(fs.structure), fs.field);
             },
             [&] (const null&) {
                 // FIXME: adjust tests and change to NULL
@@ -1108,13 +1131,16 @@ std::ostream& operator<<(std::ostream& os, const expression& expr) {
                 }
             },
             [&] (const tuple_constructor& tc) {
-                fmt::print(os, "({})", join(", ", tc.elements));
+                fmt::print(os, "({})", fmt::join(tc.elements | transformed(to_printer), ", "));
             },
             [&] (const collection_constructor& cc) {
                 switch (cc.style) {
-                case collection_constructor::style_type::list: fmt::print(os, "{}", std::to_string(cc.elements)); return;
+                case collection_constructor::style_type::list: {
+                    fmt::print(os, "[{}]", fmt::join(cc.elements | transformed(to_printer), ", "));
+                    return;
+                }
                 case collection_constructor::style_type::set: {
-                    fmt::print(os, "{{{}}}", fmt::join(cc.elements, ", "));
+                    fmt::print(os, "{{{}}}", fmt::join(cc.elements | transformed(to_printer), ", "));
                     return;
                 }
                 case collection_constructor::style_type::map: {
@@ -1129,7 +1155,7 @@ std::ostream& operator<<(std::ostream& os, const expression& expr) {
                         if (tuple.elements.size() != 2) {
                             on_internal_error(expr_logger, "map constructor element is not a tuple of arity 2");
                         }
-                        fmt::print(os, "{}:{}", tuple.elements[0], tuple.elements[1]);
+                        fmt::print(os, "{}:{}", to_printer(tuple.elements[0]), to_printer(tuple.elements[1]));
                     }
                     fmt::print(os, "}}");
                     return;
@@ -1145,11 +1171,11 @@ std::ostream& operator<<(std::ostream& os, const expression& expr) {
                         fmt::print(os, ", ");
                     }
                     first = false;
-                    fmt::print(os, "{}:{}", k, v);
+                    fmt::print(os, "{}:{}", k, to_printer(v));
                 }
                 fmt::print(os, "}}");
             },
-        }, expr);
+        }, pr.expr_to_print);
     return os;
 }
 
