@@ -256,7 +256,7 @@ public:
     {}
 
     future<query::forward_result> dispatch_to_node(netw::msg_addr id, query::forward_request req) {
-        if (!utils::fb_utilities::is_me(id.addr)) {
+        if (utils::fb_utilities::is_me(id.addr)) {
             co_return co_await _forwarder.dispatch_to_shards(req, _tr_info);
         }
 
@@ -270,6 +270,11 @@ public:
         } catch (rpc::closed_error& e) {
             flogger.warn("retrying forward_request={} on a super-coordinator after failing to send it to {} ({})", req, id, e.what());
             tracing::trace(_tr_state, "retrying forward_request={} on a super-coordinator after failing to send it to {} ({})", req, id, e.what());
+        } catch (const std::exception& e) {
+            flogger.trace("dispatching forward_request={} to {} failed ({})", req, id, e.what());
+            tracing::trace(_tr_state, "dispatching forward_request={} to {} failed ({})", req, id, e.what());
+
+            throw e;
         }
 
         // In case of forwarding failure, retry using super-coordinator as a coordinator.
