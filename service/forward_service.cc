@@ -351,20 +351,34 @@ future<query::forward_result> forward_service::dispatch_to_shards(
             return fs.execute_on_this_shard(req, tr_info);
         }));
     }
-    auto results = co_await when_all_succeed(futures.begin(), futures.end());
+    try {
+        auto results = co_await when_all_succeed(futures.begin(), futures.end());
 
-    forward_aggregates aggrs(req);
-    co_return co_await aggrs.with_thread_if_needed([&aggrs, results = std::move(results), result = std::move(result)] () mutable {
-        for (auto&& r : results) {
-            if (result) {
-                aggrs.merge(*result, std::move(r));
+        forward_aggregates aggrs(req);
+        co_return co_await aggrs.with_thread_if_needed([&aggrs, results = std::move(results), result = std::move(result)] () mutable {
+            for (auto&& r : results) {
+                if (result) {
+                    aggrs.merge(*result, std::move(r));
+                }
+                else {
+                    result = r;
+                }
             }
-            else {
-                result = r;
-            }
+            return *result;
+        });
+    }
+    catch (const std::exception& e) {
+        tracing::trace_state_ptr tr_state;
+        if (tr_info) {
+            tr_state = tracing::tracing::get_local_tracing_instance().create_session(*tr_info);
+            tracing::begin(tr_state);
         }
-        return *result;
-    });
+
+        flogger.trace("dispatching forward_request={} to shards failed ({})", req, e.what());
+        tracing::trace(tr_state, "dispatching forward_request={} to shards failed ({})", req, e.what());
+
+        throw e;
+    }
 }
 
 // This function executes forward_request on a shard.
@@ -441,9 +455,19 @@ future<query::forward_result> forward_service::execute_on_this_shard(
         );
 
         // Execute query.
-        while (!pager->is_exhausted()) {
-            co_await pager->fetch_page(rs_builder, DEFAULT_INTERNAL_PAGING_SIZE, now, timeout);
+
+        try {
+            while (!pager->is_exhausted()) {
+                co_await pager->fetch_page(rs_builder, DEFAULT_INTERNAL_PAGING_SIZE, now, timeout);
+            }
         }
+        catch (const std::exception& e) {
+            flogger.trace("execution of forward_request={} on shard failed ({})", req, e.what());
+            tracing::trace(tr_state, "execution of forward_request={} on shard failed ({})", req, e.what());
+
+            throw e;
+        }
+
 
         ranges_owned_by_this_shard.clear();
     } while (current_range);
